@@ -6,10 +6,9 @@
 
 # ---- Write your commands here (one per line) ----
 COMMANDS=(
-  "python graph_to_pytorch.py --annotation /localdata-ssd/arnau/scope/scope95_fam_annotated/ --representation sse --dataset scope95_small --epochs 120 --operator gine --seed 77 --output results/gine_sse/77"
-  "python graph_to_pytorch.py --annotation /localdata-ssd/arnau/scope/scope95_fam_annotated/ --representation sse --dataset scope95_small --epochs 120 --operator gine --seed 420 --output results/gine_sse/420"
-  "python graph_to_pytorch.py --annotation /localdata-ssd/arnau/scope/scope95_fam_annotated/ --representation sse --dataset scope95_small --epochs 120 --operator gine --seed 666 --output results/gine_sse/666"
-)
+  "python graph_to_pytorch.py --annotation /localdata-ssd/arnau/scope/scope95_fam_annotated/ --representation sse --dataset scope95_full --epochs 150 --operator gine --seed 42 --hiddendim 1024 --output results/full_gine_optim/1024-42"
+  "python graph_to_pytorch.py --annotation /localdata-ssd/arnau/scope/scope95_fam_annotated/ --representation sse --dataset scope95_full --epochs 150 --operator gine --seed 42 --hiddendim 2048 --output results/full_gine_optim/2048-42"
+ )
 # --------------------------------------------------
 
 N="${1:-1}"
