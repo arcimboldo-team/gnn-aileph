@@ -15,7 +15,7 @@ import torch.nn.functional as F
 from torch_geometric.data import Data, Dataset
 from torch.utils.data import Sampler
 from torch_geometric.loader import DataLoader
-from torch_geometric.nn import GATv2Conv, GINEConv, global_max_pool, global_mean_pool
+from torch_geometric.nn import GATv2Conv, GINEConv, PNAConv, global_max_pool, global_mean_pool
 from torch.utils.tensorboard import SummaryWriter
 from retrieval_metrics import embed_graphs, family_sensitivity
 
@@ -170,13 +170,9 @@ def fit_feature_scaling(training_graphs):
         values = torch.cat(
             [graph[field] for graph in training_graphs], dim=0
         ).double()
-
         mean = values.mean(dim=0)
         std = values.std(dim=0, unbiased=False)
-
-        # Constant columns use a scale of 1.
         std[std < 1e-8] = 1.0
-
         statistics[field] = {"mean": mean, "std": std}
 
     return statistics
@@ -229,10 +225,12 @@ class FamilyBatchSampler(Sampler):
 
 class AlephModel(nn.Module):
     """Shared CV/fragment encoder with mean/max graph pooling."""
-    def __init__(self, node_dim: int = 3, edge_dim: int = 3, hidden_dim: int = 128, embedding_dim: int = 128, num_layers: int = 3, heads: int = 4, dropout: float = 0.0, operator: str = "gine"):
+    def __init__(self, node_dim: int = 3, edge_dim: int = 3, hidden_dim: int = 128, embedding_dim: int = 128, num_layers: int = 3, heads: int = 4, dropout: float = 0.0, operator: str = "gine", deg=None):
         super().__init__()
-        if operator not in ("gatv2", "gine"):
-            raise ValueError("Use operator='gatv2' or operator='gine'")
+        if operator not in ("gatv2", "gine", "pna"):
+            raise ValueError("Use operator='gatv2', operator='gine' or operator='pna'")
+        if operator == "pna" and deg is None:
+            raise ValueError("PNA requires a degree histogram from the training graphs")
         if num_layers < 1:
             raise ValueError("num_layers must be positive")
         if operator == "gatv2" and (heads < 1 or hidden_dim % heads):
@@ -251,6 +249,13 @@ class AlephModel(nn.Module):
                 conv = GINEConv(nn.Sequential(
                     nn.Linear(in_dim, hidden_dim), nn.ReLU(),
                     nn.Linear(hidden_dim, hidden_dim)), edge_dim=edge_dim)
+            elif operator == "pna":
+                conv = PNAConv(
+                    in_dim, hidden_dim, edge_dim=edge_dim, deg=deg,
+                    aggregators=["mean", "min", "max", "std"],
+                    scalers=["identity", "amplification", "attenuation"],
+                    towers=1, pre_layers=1, post_layers=1,
+                )
             else:
                 conv = GATv2Conv(
                     in_channels=in_dim,
@@ -366,12 +371,14 @@ class SupervisedContrastiveLoss(nn.Module):
         return -(self.temperature / self.base_temperature) * mean_positive_log_prob[valid].mean()
 
 
-def train(model, train_loader, val_loader, criterion, device, gallery_loader, epochs=50, eval_every=1, lr=1e-4, writer=None, save_model=False, model_path="graph_embed.pth"):
+def train(model, train_loader, val_loader, criterion, device, gallery_loader, epochs=50, eval_every=1, lr=1e-4, writer=None, save_model=False, model_path="graph_embed.pth", constant_lr=False):
     # Hyperparameters
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr) # Investigate AdamW, weight decay and so
     # Patience ony cares about evaluations, so be careful with eval_every
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-6) # (patience) * (eval_every) = real reduce_every
+    scheduler = None
+    if not constant_lr:
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-6) # (patience) * (eval_every) = real reduce_every
     best_sensitivity = None
     val_names = {graph.name for graph in val_loader.dataset}
     global_step = 0
@@ -428,7 +435,8 @@ def train(model, train_loader, val_loader, criterion, device, gallery_loader, ep
                 if writer is not None:
                     writer.add_scalar("Validation/family_sensitivity", sensitivity, epoch+1)
                 print(f"Validation family sensitivity: {sensitivity:.4f}")
-                scheduler.step(avg_val_loss)
+                if scheduler is not None:
+                    scheduler.step(avg_val_loss)
 
                 # Logging
                 elapsed = time.time() - start
@@ -461,7 +469,10 @@ def main():
     parser.add_argument("--dataset", choices=("scope95_full", "scope95_small"), default="scope95_small",
                         help="SID selections in the datasets folder beside this script")
     parser.add_argument("--representation", choices=("cv", "sse"), default="cv")
-    parser.add_argument("--operator", choices=("gatv2", "gine"), default="gine")
+    parser.add_argument("--operator", choices=("gatv2", "gine", "pna"), default="gine")
+    parser.add_argument("--hidden-dim", type=int, default=128)
+    parser.add_argument("--lr", type=float, default=1e-2)
+    parser.add_argument("--constant-lr", action="store_true", help="Keep the learning rate fixed instead of reducing it on validation loss")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--scale", type=bool, default=True)
     parser.add_argument("--seed", type=int, default=17)
@@ -496,8 +507,13 @@ def main():
     test_loader = DataLoader(datasets["test_unseen_sid"], batch_size=64, shuffle=False)
     gallery = [graph for dataset in datasets.values() for graph in dataset]
     gallery_loader = DataLoader(gallery, batch_size=32, shuffle=False)
+    deg = None
+    if args.operator == "pna":
+        # Count each training graph once, without family oversampling.
+        deg = PNAConv.get_degree_histogram(DataLoader(datasets["train_sid"], batch_size=64))
+        torch.save(deg, args.output / "pna_degree_histogram.pt")
     model = AlephModel(node_dim=datasets["train_sid"][0].x.shape[1],
-                       edge_dim=datasets["train_sid"][0].edge_attr.shape[1], hidden_dim=128, embedding_dim=128, dropout=0.0, operator=args.operator)
+                       edge_dim=datasets["train_sid"][0].edge_attr.shape[1], hidden_dim=args.hidden_dim, embedding_dim=128, dropout=0.0, operator=args.operator, deg=deg)
     criterion = SupervisedContrastiveLoss(temperature=0.1)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model_path = args.output / "graph_embed.pth"
@@ -509,7 +525,8 @@ def main():
                          "split_graph_counts": {name: len(dataset) for name, dataset in datasets.items()}}
         writer.add_text("Run/config", json.dumps(configuration, indent=2, default=str), 0)
         train(model, train_loader, val_loader, criterion, device, gallery_loader, epochs=args.epochs,
-              eval_every=1, lr=1e-2, writer=writer, save_model=True, model_path=model_path)
+              eval_every=1, lr=args.lr, writer=writer, save_model=True, model_path=model_path,
+              constant_lr=args.constant_lr)
         model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
         test_loss = evaluate_loss(model, test_loader, criterion, device)
         writer.add_scalar("Test Loss/best_validation_checkpoint", test_loss, args.epochs)
