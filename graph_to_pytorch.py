@@ -30,7 +30,7 @@ def read_selection(path):
     return rows
 
 
-def graph_to_pytorch(data_path, output_path, dist_threshold=10.0, representation="cv", annotation_dir=None):
+def graph_to_pytorch(data_path, output_path, dist_threshold=10.0, representation="cv", n_features=2, annotation_dir=None):
     output_path = Path(output_path)
     output_path.mkdir(parents=True, exist_ok=True)
     selection = []
@@ -41,7 +41,7 @@ def graph_to_pytorch(data_path, output_path, dist_threshold=10.0, representation
         name = path.name.removesuffix(".pkl")
         name = Path(name).stem
         family = path.parent.name
-        graph = build_graph(path, name, family, dist_threshold, representation=representation, annotation_dir=annotation_dir)
+        graph = build_graph(path, name, family, dist_threshold, representation=representation, n_features=n_features, annotation_dir=annotation_dir)
         if graph.num_nodes == 0:
             excluded.append(f"{name} {family}")
             continue
@@ -69,18 +69,18 @@ def load_annotation(path, family="", annotation_dir=None):
     return annotation
 
 
-def build_graph(path, name, family, dist_threshold=10.0, representation="cv", annotation_dir=None):
+def build_graph(path, name, family, dist_threshold=10.0, representation="cv", n_features=2, annotation_dir=None):
     builders = {"cv": build_graph_cv, "sse": build_graph_sse}
     if representation not in builders:
         raise ValueError("Use representation='cv' or representation='sse'")
     annotation = load_annotation(path, family, annotation_dir)
-    graph = builders[representation](annotation, dist_threshold=dist_threshold)
+    graph = builders[representation](annotation, dist_threshold=dist_threshold, n_features=n_features)
     graph.name = name
     graph.family = family
     return graph
 
 
-def build_graph_cv(annotation, dist_threshold=10.0):
+def build_graph_cv(annotation, dist_threshold=10.0, n_features=2):
     """One non-coil CV per node, using the standalone annotation classes."""
     cvs = annotation.get_cvs(include_coil=False)
     index = {cv.cvid: i for i, cv in enumerate(cvs)}
@@ -97,7 +97,7 @@ def build_graph_cv(annotation, dist_threshold=10.0):
                 edge_attr=torch.tensor(edge_attr, dtype=torch.float32).reshape(-1, 5))
 
 
-def build_graph_sse(annotation, dist_threshold=10.0):
+def build_graph_sse(annotation, dist_threshold=10.0, n_features=2):
     """One non-coil fragment per node; connect by the closest CV-pair distance."""
     fragments = [fragment for fragment in annotation.get_sse_fragments() if fragment.cvids]
     index = {fragment.fragid: i for i, fragment in enumerate(fragments)}
@@ -106,10 +106,8 @@ def build_graph_sse(annotation, dist_threshold=10.0):
     for fragment in fragments:
         cvs = np.asarray([vectors[cvid] for cvid in fragment.cvids])
         cv_sum, cv_mean = cvs.sum(axis=0), cvs.mean(axis=0)
-        node_features.append([
-            np.mean(fragment.cvls), np.linalg.norm(cv_sum), fragment.vecLength[0],
-            np.linalg.norm(cv_mean),
-        ])
+        feature_list = [np.linalg.norm(cv_sum), fragment.vecLength[0], np.mean(fragment.cvls), np.linalg.norm(cv_mean)]
+        node_features.append(feature_list[:n_features])
     edge_index, edge_attr = [], []
     for fragid in index:
         for other, edge in annotation.distances_between_fragments.get(fragid, {}).items():
@@ -117,14 +115,14 @@ def build_graph_sse(annotation, dist_threshold=10.0):
                 edge_index.append([index[fragid], index[other]])
                 edge_attr.append([edge.dist, edge.angle1, edge.angle2,
                                   edge.min_distance, edge.max_distance, edge.weight])
-    return Data(x=torch.tensor(node_features, dtype=torch.float32).reshape(-1, 4),
+    return Data(x=torch.tensor(node_features, dtype=torch.float32).reshape(-1, n_features),
                 edge_index=torch.tensor(edge_index, dtype=torch.long).reshape(-1, 2).T.contiguous(),
                 edge_attr=torch.tensor(edge_attr, dtype=torch.float32).reshape(-1, 6))
 
 
 class GraphDataset(Dataset):
     """Build the selected graphs once from complete AlephPDB annotation pickles."""
-    def __init__(self, data_path, selection_path, representation="cv", dist_threshold=10.0):
+    def __init__(self, data_path, selection_path, representation="cv", n_features=2, dist_threshold=10.0):
         super().__init__()
         self.data_path = Path(data_path)
         if not self.data_path.is_dir():
@@ -142,7 +140,7 @@ class GraphDataset(Dataset):
             if (name, fam) in missing:
                 continue
             path = self.data_path / fam / f"{name}.ent.pkl"
-            graph = build_graph(path, name, fam, dist_threshold, representation=representation)
+            graph = build_graph(path, name, fam, dist_threshold, representation=representation, n_features=n_features)
             graph.validate(raise_on_error=True)
             if graph.num_nodes == 0:
                 self.excluded.append((name, fam))
@@ -294,6 +292,80 @@ class AlephModel(nn.Module):
             batch = x.new_zeros(len(x), dtype=torch.long)
         g = torch.cat([global_mean_pool(x, batch), global_max_pool(x, batch)], dim=-1)
         return F.normalize(self.readout(g), dim=-1)
+
+class DiceyAlephModel(nn.Module):
+    """Shared CV/fragment encoder with mean/max graph pooling."""
+    def __init__(self, node_dim: int = 3, edge_dim: int = 3, hidden_dim: int = 128, embedding_dim: int = 128, num_layers: int = 3, heads: int = 4, dropout: float = 0.0, operator: str = "gine", deg=None):
+        super().__init__()
+        if operator not in ("gatv2", "gine", "pna"):
+            raise ValueError("Use operator='gatv2', operator='gine' or operator='pna'")
+        if operator == "pna" and deg is None:
+            raise ValueError("PNA requires a degree histogram from the training graphs")
+        if num_layers < 1:
+            raise ValueError("num_layers must be positive")
+        if operator == "gatv2" and (heads < 1 or hidden_dim % heads):
+            raise ValueError("GATv2 hidden_dim must be divisible by positive heads")
+        self.dropout = dropout
+        self.hidden_dim = hidden_dim
+        self.operator = operator
+
+        self.convs = nn.ModuleList()
+        self.norms = nn.ModuleList()
+        self.residuals = nn.ModuleList()
+
+        self.edge_encoder = nn.Sequential(nn.Linear(edge_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, hidden_dim))
+        edge_dim = hidden_dim  # all convs now receive encoded edges
+
+        in_dim = hidden_dim
+        for _ in range(num_layers):
+            if operator == "gine":
+                conv = GINEConv(nn.Sequential(
+                    nn.Linear(in_dim, 2 * hidden_dim), nn.LayerNorm(2 * hidden_dim), nn.ReLU(),
+                    nn.Linear(2 * hidden_dim, hidden_dim)), train_eps=True, edge_dim=edge_dim)
+            elif operator == "pna":
+                conv = PNAConv(
+                    in_dim, hidden_dim, edge_dim=edge_dim, deg=deg,
+                    aggregators=["mean", "min", "max", "std"],
+                    scalers=["identity", "amplification", "attenuation"],
+                    towers=1, pre_layers=1, post_layers=1,
+                )
+            else:
+                conv = GATv2Conv(
+                    in_channels=in_dim,
+                    out_channels=hidden_dim // heads,
+                    heads=heads,
+                    concat=True,
+                    dropout=dropout,
+                    edge_dim=edge_dim,
+                )
+            self.convs.append(conv)
+            self.norms.append(nn.LayerNorm(hidden_dim))
+            self.residuals.append(
+                nn.Linear(in_dim, hidden_dim) if in_dim != hidden_dim else nn.Identity()
+            )
+            in_dim = hidden_dim
+
+        self.readout = nn.Sequential(
+            nn.Linear(2 * hidden_dim * num_layers, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, embedding_dim),
+        )
+        self.input_projection = nn.Linear(node_dim, hidden_dim)
+
+    def forward(self, x, edge_index=None, edge_attr=None, batch=None):
+        if isinstance(x, Data):
+            x, edge_index, edge_attr, batch = x.x, x.edge_index, x.edge_attr, x.batch
+        if batch is None:
+            batch = x.new_zeros(len(x), dtype=torch.long)
+        x = self.input_projection(x)
+        edge_attr = self.edge_encoder(edge_attr)
+        pooled = []
+        for conv, norm, res in zip(self.convs, self.norms, self.residuals):
+            h = conv(F.elu(norm(x)), edge_index, edge_attr=edge_attr)  # pre-norm
+            x = res(x) + F.dropout(h, p=self.dropout, training=self.training)
+            pooled.append(torch.cat([global_mean_pool(x, batch), global_max_pool(x, batch)], -1))
+        return F.normalize(self.readout(torch.cat(pooled, -1)), dim=-1)
 
 
 class FamilyContrastiveLoss(nn.Module):
@@ -466,12 +538,14 @@ def main():
     start = time.time()
     parser = argparse.ArgumentParser(description="Train CV or SSE graphs from ALEPH annotations")
     parser.add_argument("--annotations", type=Path, required=True, help="Annotation folder containing family/SID.ent.pkl")
-    parser.add_argument("--dataset", choices=("scope95_full", "scope95_small"), default="scope95_small",
+    parser.add_argument("--dataset", choices=("scope95_full", "scope95_small", "scope95_toy"), default="scope95_small",
                         help="SID selections in the datasets folder beside this script")
     parser.add_argument("--representation", choices=("cv", "sse"), default="cv")
+    parser.add_argument("--n-features", type=int, default=2)
     parser.add_argument("--operator", choices=("gatv2", "gine", "pna"), default="gine")
     parser.add_argument("--hidden-dim", type=int, default=128)
-    parser.add_argument("--lr", type=float, default=1e-2)
+    parser.add_argument("--num-layers", type=int, default=3)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--constant-lr", action="store_true", help="Keep the learning rate fixed instead of reducing it on validation loss")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--scale", type=bool, default=True)
@@ -491,7 +565,7 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     datasets = {}
     for name in split_names:
-        dataset = GraphDataset(args.annotations, split_dir / f"{name}.txt", representation=args.representation)
+        dataset = GraphDataset(args.annotations, split_dir / f"{name}.txt", representation=args.representation, n_features=args.n_features)
         datasets[name] = dataset
         if not len(dataset):
             raise ValueError(f"No usable graphs in {name}")
@@ -513,7 +587,7 @@ def main():
         deg = PNAConv.get_degree_histogram(DataLoader(datasets["train_sid"], batch_size=64))
         torch.save(deg, args.output / "pna_degree_histogram.pt")
     model = AlephModel(node_dim=datasets["train_sid"][0].x.shape[1],
-                       edge_dim=datasets["train_sid"][0].edge_attr.shape[1], hidden_dim=args.hidden_dim, embedding_dim=128, dropout=0.0, operator=args.operator, deg=deg)
+                       edge_dim=datasets["train_sid"][0].edge_attr.shape[1], hidden_dim=args.hidden_dim, embedding_dim=128, num_layers=args.num_layers, dropout=0.0, operator=args.operator, deg=deg)
     criterion = SupervisedContrastiveLoss(temperature=0.1)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model_path = args.output / "graph_embed.pth"
@@ -531,9 +605,10 @@ def main():
         test_loss = evaluate_loss(model, test_loader, criterion, device)
         writer.add_scalar("Test Loss/best_validation_checkpoint", test_loss, args.epochs)
         embeddings, rows = embed_graphs(model, gallery_loader, device)
-        results = {name: {"family_sensitivity": family_sensitivity(embeddings, rows, {graph.name for graph in datasets[name]})}
-                   for name in ("val_unseen_sid", "test_unseen_sid")}
-        (args.output / "results.json").write_text(json.dumps(results, indent=2) + "\n")
+        results = {"args": vars(args),
+           **{name: {"family_sensitivity": family_sensitivity(embeddings, rows, {graph.name for graph in datasets[name]})}
+              for name in ("val_unseen_sid", "test_unseen_sid")}}
+        (args.output / "results.json").write_text(json.dumps(results, indent=2, default=str) + "\n")
         writer.add_scalar("Test/family_sensitivity", results["test_unseen_sid"]["family_sensitivity"], args.epochs)
         (args.output / "test_loss.txt").write_text(f"{test_loss}\n")
         print(f"Test loss for the best validation checkpoint: {test_loss:.4f}")
