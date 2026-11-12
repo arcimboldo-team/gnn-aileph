@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.data import Data, Dataset
+from torch_geometric.utils import dropout_edge, mask_feature
 from torch.utils.data import Sampler
 from torch_geometric.loader import DataLoader
 from torch_geometric.nn import GATv2Conv, GINEConv, PNAConv, global_max_pool, global_mean_pool
@@ -119,6 +120,12 @@ def build_graph_sse(annotation, dist_threshold=10.0, n_features=2):
                 edge_index=torch.tensor(edge_index, dtype=torch.long).reshape(-1, 2).T.contiguous(),
                 edge_attr=torch.tensor(edge_attr, dtype=torch.float32).reshape(-1, 6))
 
+def augment(data, edge_drop_p=0.2, feat_mask_p=0.2):
+    data_aug = data.clone()
+    data_aug.edge_index, edge_mask = dropout_edge(data.edge_index, p=edge_drop_p)
+    data_aug.edge_attr = data.edge_attr[edge_mask]
+    data_aug.x, _ = mask_feature(data.x, p=feat_mask_p, mode='all')
+    return data_aug
 
 class GraphDataset(Dataset):
     """Build the selected graphs once from complete AlephPDB annotation pickles."""
@@ -154,6 +161,12 @@ class GraphDataset(Dataset):
         self.families = list(self.graph_by_fam.keys())
         print(f"Loaded {len(self.graphs)} graphs; missing {len(self.missing)} annotations; "
               f"excluded {len(self.excluded)} empty graphs", flush=True)
+
+    def __getitem__(self, idx):
+        if isinstance(idx, tuple):
+            i, aug = idx
+            return augment(self.data[i]) if aug else self.data[i]
+        return super().__getitem__(idx)
 
     def len(self):
         return len(self.graphs)
@@ -210,9 +223,10 @@ class FamilyBatchSampler(Sampler):
                 indices = self.dataset.graph_by_fam[family]
 
                 if len(indices) < self.num_per_family:
-                    sampled = random.choices(indices, k = self.num_per_family)
-                else:
-                    sampled = random.sample(indices, self.num_per_family)
+                    extra = random.choices(indices, k=self.num_per_family - len(indices))
+                    sampled = [(i, False) for i in np.indices] + [(i, True) for i in extra]                    
+                else:                    
+                    sampled = [(i, False) for i in random.sample(indices, self.num_per_family)]
 
                 batch_indices.extend(sampled)
 
@@ -450,7 +464,7 @@ def train(model, train_loader, val_loader, criterion, device, gallery_loader, ep
     # Patience ony cares about evaluations, so be careful with eval_every
     scheduler = None
     if not constant_lr:
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-6) # (patience) * (eval_every) = real reduce_every
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=5, min_lr=1e-6) # (patience) * (eval_every) = real reduce_every
     best_sensitivity = None
     val_names = {graph.name for graph in val_loader.dataset}
     global_step = 0
@@ -508,7 +522,7 @@ def train(model, train_loader, val_loader, criterion, device, gallery_loader, ep
                     writer.add_scalar("Validation/family_sensitivity", sensitivity, epoch+1)
                 print(f"Validation family sensitivity: {sensitivity:.4f}")
                 if scheduler is not None:
-                    scheduler.step(avg_val_loss)
+                    scheduler.step(sensitivity)
 
                 # Logging
                 elapsed = time.time() - start
@@ -548,7 +562,7 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--constant-lr", action="store_true", help="Keep the learning rate fixed instead of reducing it on validation loss")
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--scale", type=bool, default=True)
+    parser.add_argument("--scale", action=argparse.BooleanOptionalAction, default=True) # --scale and --no-scale
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--output", type=Path, default=Path("training_output"))
     args = parser.parse_args()
@@ -586,8 +600,9 @@ def main():
         # Count each training graph once, without family oversampling.
         deg = PNAConv.get_degree_histogram(DataLoader(datasets["train_sid"], batch_size=64))
         torch.save(deg, args.output / "pna_degree_histogram.pt")
-    model = AlephModel(node_dim=datasets["train_sid"][0].x.shape[1],
+    model = DiceyAlephModel(node_dim=datasets["train_sid"][0].x.shape[1],
                        edge_dim=datasets["train_sid"][0].edge_attr.shape[1], hidden_dim=args.hidden_dim, embedding_dim=128, num_layers=args.num_layers, dropout=0.0, operator=args.operator, deg=deg)
+    model_params = sum(p.numel() for p in model.parameters() if p.requires_grad) # traineable params only
     criterion = SupervisedContrastiveLoss(temperature=0.1)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model_path = args.output / "graph_embed.pth"
@@ -606,6 +621,7 @@ def main():
         writer.add_scalar("Test Loss/best_validation_checkpoint", test_loss, args.epochs)
         embeddings, rows = embed_graphs(model, gallery_loader, device)
         results = {"args": vars(args),
+                   "model_parameters": model_params,
            **{name: {"family_sensitivity": family_sensitivity(embeddings, rows, {graph.name for graph in datasets[name]})}
               for name in ("val_unseen_sid", "test_unseen_sid")}}
         (args.output / "results.json").write_text(json.dumps(results, indent=2, default=str) + "\n")
