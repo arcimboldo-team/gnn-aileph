@@ -224,7 +224,7 @@ class FamilyBatchSampler(Sampler):
 
                 if len(indices) < self.num_per_family:
                     extra = random.choices(indices, k=self.num_per_family - len(indices))
-                    sampled = [(i, False) for i in np.indices] + [(i, True) for i in extra]                    
+                    sampled = [(i, False) for i in range(len(indices))] + [(i, True) for i in extra]                    
                 else:                    
                     sampled = [(i, False) for i in random.sample(indices, self.num_per_family)]
 
@@ -556,6 +556,7 @@ def main():
                         help="SID selections in the datasets folder beside this script")
     parser.add_argument("--representation", choices=("cv", "sse"), default="cv")
     parser.add_argument("--n-features", type=int, default=2)
+    parser.add_argument("--model", choices=("aleph", "dicey"), default="aleph")
     parser.add_argument("--operator", choices=("gatv2", "gine", "pna"), default="gine")
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--num-layers", type=int, default=3)
@@ -600,7 +601,11 @@ def main():
         # Count each training graph once, without family oversampling.
         deg = PNAConv.get_degree_histogram(DataLoader(datasets["train_sid"], batch_size=64))
         torch.save(deg, args.output / "pna_degree_histogram.pt")
-    model = DiceyAlephModel(node_dim=datasets["train_sid"][0].x.shape[1],
+    if args.model == "dicey":
+        model = DiceyAlephModel(node_dim=datasets["train_sid"][0].x.shape[1],
+                       edge_dim=datasets["train_sid"][0].edge_attr.shape[1], hidden_dim=args.hidden_dim, embedding_dim=128, num_layers=args.num_layers, dropout=0.0, operator=args.operator, deg=deg)
+    else:
+        model = AlephModel(node_dim=datasets["train_sid"][0].x.shape[1],
                        edge_dim=datasets["train_sid"][0].edge_attr.shape[1], hidden_dim=args.hidden_dim, embedding_dim=128, num_layers=args.num_layers, dropout=0.0, operator=args.operator, deg=deg)
     model_params = sum(p.numel() for p in model.parameters() if p.requires_grad) # traineable params only
     criterion = SupervisedContrastiveLoss(temperature=0.1)
@@ -628,7 +633,7 @@ def main():
         writer.add_scalar("Test/family_sensitivity", results["test_unseen_sid"]["family_sensitivity"], args.epochs)
         (args.output / "test_loss.txt").write_text(f"{test_loss}\n")
         print(f"Test loss for the best validation checkpoint: {test_loss:.4f}")
-
+# make augmentation optional
 
 if __name__ == "__main__":
     main()
