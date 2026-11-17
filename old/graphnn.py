@@ -260,12 +260,43 @@ class ScoreLoss(nn.Module):
 
 class FamilyContrastiveLoss(nn.Module):
     """
+    Pairwise supervised contrastive loss for PDB graph embeddings.
+
+    Same-family graphs are positive pairs.
+    Different-family graphs are negative pairs.
+    """
+
+    def __init__(self, temperature=0.07):
+        super().__init__()
+        self.temperature = temperature
+
+    def forward(self, embeddings, families):
+        embeddings = F.normalize(embeddings, dim=-1)
+        similarity = embeddings @ embeddings.T
+
+        same_family = torch.tensor(
+            [[a == b for b in families] for a in families],
+            device=embeddings.device,
+        )
+        signs = same_family.float() * 2 - 1
+        loss = -F.logsigmoid(signs * similarity / self.temperature)
+
+        # Compare each pair once; exclude comparisons with itself.
+        pairs = torch.triu(torch.ones_like(same_family), diagonal=1)
+        if not pairs.any():
+            return embeddings.sum() * 0
+
+        return loss[pairs].mean()
+
+
+class FamilyContrastiveLoss_old(nn.Module):
+    """
     Loss function based on the assumption that PDBs from the same families should be similar while different from PDBs from other families
     Contrastive loss, where families are the labels to categorize similarity
     'margin' determines the point at which two PDBs from different families are different enough and the penalization stops
     """
     def __init__(self, margin=0.2):
-        super(FamilyContrastiveLoss, self).__init__()
+        super(FamilyContrastiveLoss_old, self).__init__()
         self.margin = margin
 
     def forward(self, embed1, embed2, idx1, idx2, family1, family2):

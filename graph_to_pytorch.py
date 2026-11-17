@@ -31,7 +31,7 @@ def read_selection(path):
     return rows
 
 
-def graph_to_pytorch(data_path, output_path, dist_threshold=10.0, representation="cv", n_features=2, annotation_dir=None):
+def graph_to_pytorch(data_path, output_path, dist_threshold=10.0, representation="sse", n_features=4, annotation_dir=None):
     output_path = Path(output_path)
     output_path.mkdir(parents=True, exist_ok=True)
     selection = []
@@ -70,7 +70,7 @@ def load_annotation(path, family="", annotation_dir=None):
     return annotation
 
 
-def build_graph(path, name, family, dist_threshold=10.0, representation="cv", n_features=2, annotation_dir=None):
+def build_graph(path, name, family, dist_threshold=10.0, representation="sse", n_features=4, annotation_dir=None):
     builders = {"cv": build_graph_cv, "sse": build_graph_sse}
     if representation not in builders:
         raise ValueError("Use representation='cv' or representation='sse'")
@@ -81,7 +81,7 @@ def build_graph(path, name, family, dist_threshold=10.0, representation="cv", n_
     return graph
 
 
-def build_graph_cv(annotation, dist_threshold=10.0, n_features=2):
+def build_graph_cv(annotation, dist_threshold=10.0, n_features=4):
     """One non-coil CV per node, using the standalone annotation classes."""
     cvs = annotation.get_cvs(include_coil=False)
     index = {cv.cvid: i for i, cv in enumerate(cvs)}
@@ -98,7 +98,7 @@ def build_graph_cv(annotation, dist_threshold=10.0, n_features=2):
                 edge_attr=torch.tensor(edge_attr, dtype=torch.float32).reshape(-1, 5))
 
 
-def build_graph_sse(annotation, dist_threshold=10.0, n_features=2):
+def build_graph_sse(annotation, dist_threshold=10.0, n_features=4):
     """One non-coil fragment per node; connect by the closest CV-pair distance."""
     fragments = [fragment for fragment in annotation.get_sse_fragments() if fragment.cvids]
     index = {fragment.fragid: i for i, fragment in enumerate(fragments)}
@@ -120,16 +120,18 @@ def build_graph_sse(annotation, dist_threshold=10.0, n_features=2):
                 edge_index=torch.tensor(edge_index, dtype=torch.long).reshape(-1, 2).T.contiguous(),
                 edge_attr=torch.tensor(edge_attr, dtype=torch.float32).reshape(-1, 6))
 
-def augment(data, edge_drop_p=0.2, feat_mask_p=0.2):
+
+def augment(data, edge_drop_p=0.05, feat_mask_p=0.2):
     data_aug = data.clone()
     data_aug.edge_index, edge_mask = dropout_edge(data.edge_index, p=edge_drop_p)
     data_aug.edge_attr = data.edge_attr[edge_mask]
     data_aug.x, _ = mask_feature(data.x, p=feat_mask_p, mode='all')
     return data_aug
 
+
 class GraphDataset(Dataset):
     """Build the selected graphs once from complete AlephPDB annotation pickles."""
-    def __init__(self, data_path, selection_path, representation="cv", n_features=2, dist_threshold=10.0):
+    def __init__(self, data_path, selection_path, representation, n_features, augmentation, dist_threshold=10.0):
         super().__init__()
         self.data_path = Path(data_path)
         if not self.data_path.is_dir():
@@ -138,6 +140,7 @@ class GraphDataset(Dataset):
         self.missing = [(sid, family) for sid, family in rows
                         if not (self.data_path / family / f"{sid}.ent.pkl").is_file()]
         missing = set(self.missing)
+        self.augmentation = augmentation
         self.graphs = []
         self.data = []
         self.graph_by_fam = {}
@@ -165,7 +168,10 @@ class GraphDataset(Dataset):
     def __getitem__(self, idx):
         if isinstance(idx, tuple):
             i, aug = idx
-            return augment(self.data[i]) if aug else self.data[i]
+            if self.augmentation:
+                return augment(self.data[i]) if aug else self.data[i]
+            else:
+                return self.data[i]
         return super().__getitem__(idx)
 
     def len(self):
@@ -173,6 +179,7 @@ class GraphDataset(Dataset):
 
     def get(self, idx):
         return self.data[idx]
+
 
 def fit_feature_scaling(training_graphs):
     statistics = {}
@@ -188,6 +195,7 @@ def fit_feature_scaling(training_graphs):
 
     return statistics
 
+
 def scale_graph(graph, statistics):
     graph = graph.clone()
 
@@ -200,8 +208,9 @@ def scale_graph(graph, statistics):
 
     return graph
 
+
 class FamilyBatchSampler(Sampler):
-    def __init__(self, dataset, num_per_family = 6, other_families = 5):
+    def __init__(self, dataset, num_per_family, other_families):
         self.dataset = dataset
         self.num_per_family = num_per_family
         self.total_families = other_families + 1 # Me and others
@@ -235,9 +244,12 @@ class FamilyBatchSampler(Sampler):
     def __len__(self):
         return len(self.dataset.families)
 
+
 class AlephModel(nn.Module):
     """Shared CV/fragment encoder with mean/max graph pooling."""
-    def __init__(self, node_dim: int = 3, edge_dim: int = 3, hidden_dim: int = 128, embedding_dim: int = 128, num_layers: int = 3, heads: int = 4, dropout: float = 0.0, operator: str = "gine", deg=None):
+    def __init__(self, node_dim: int = 3, edge_dim: int = 3,
+                 hidden_dim: int = 128, embedding_dim: int = 128, num_layers: int = 3,
+                 heads_dim: int = 64, dropout: float = 0.0, operator: str = "gine", deg=None):
         super().__init__()
         if operator not in ("gatv2", "gine", "pna"):
             raise ValueError("Use operator='gatv2', operator='gine' or operator='pna'")
@@ -245,7 +257,7 @@ class AlephModel(nn.Module):
             raise ValueError("PNA requires a degree histogram from the training graphs")
         if num_layers < 1:
             raise ValueError("num_layers must be positive")
-        if operator == "gatv2" and (heads < 1 or hidden_dim % heads):
+        if operator == "gatv2" and (hidden_dim % heads_dim):
             raise ValueError("GATv2 hidden_dim must be divisible by positive heads")
         self.dropout = dropout
         self.hidden_dim = hidden_dim
@@ -271,8 +283,8 @@ class AlephModel(nn.Module):
             else:
                 conv = GATv2Conv(
                     in_channels=in_dim,
-                    out_channels=hidden_dim // heads,
-                    heads=heads,
+                    out_channels=heads_dim,
+                    heads=hidden_dim // heads_dim,
                     concat=True,
                     dropout=dropout,
                     edge_dim=edge_dim,
@@ -309,7 +321,9 @@ class AlephModel(nn.Module):
 
 class DiceyAlephModel(nn.Module):
     """Shared CV/fragment encoder with mean/max graph pooling."""
-    def __init__(self, node_dim: int = 3, edge_dim: int = 3, hidden_dim: int = 128, embedding_dim: int = 128, num_layers: int = 3, heads: int = 4, dropout: float = 0.0, operator: str = "gine", deg=None):
+    def __init__(self, node_dim: int = 3, edge_dim: int = 3,
+                 hidden_dim: int = 128, embedding_dim: int = 128, num_layers: int = 3,
+                 heads_dim: int = 64, dropout: float = 0.0, operator: str = "gine", deg=None):
         super().__init__()
         if operator not in ("gatv2", "gine", "pna"):
             raise ValueError("Use operator='gatv2', operator='gine' or operator='pna'")
@@ -317,7 +331,7 @@ class DiceyAlephModel(nn.Module):
             raise ValueError("PNA requires a degree histogram from the training graphs")
         if num_layers < 1:
             raise ValueError("num_layers must be positive")
-        if operator == "gatv2" and (heads < 1 or hidden_dim % heads):
+        if operator == "gatv2" and (hidden_dim % heads_dim):
             raise ValueError("GATv2 hidden_dim must be divisible by positive heads")
         self.dropout = dropout
         self.hidden_dim = hidden_dim
@@ -346,8 +360,8 @@ class DiceyAlephModel(nn.Module):
             else:
                 conv = GATv2Conv(
                     in_channels=in_dim,
-                    out_channels=hidden_dim // heads,
-                    heads=heads,
+                    out_channels=heads_dim,
+                    heads=hidden_dim // heads_dim,
                     concat=True,
                     dropout=dropout,
                     edge_dim=edge_dim,
@@ -382,39 +396,7 @@ class DiceyAlephModel(nn.Module):
         return F.normalize(self.readout(torch.cat(pooled, -1)), dim=-1)
 
 
-class FamilyContrastiveLoss(nn.Module):
-    """
-    Pairwise supervised contrastive loss for PDB graph embeddings.
-
-    Same-family graphs are positive pairs.
-    Different-family graphs are negative pairs.
-    """
-
-    def __init__(self, temperature=0.07):
-        super().__init__()
-        self.temperature = temperature
-
-    def forward(self, embeddings, families):
-        embeddings = F.normalize(embeddings, dim=-1)
-        similarity = embeddings @ embeddings.T
-
-        same_family = torch.tensor(
-            [[a == b for b in families] for a in families],
-            device=embeddings.device,
-        )
-        signs = same_family.float() * 2 - 1
-        loss = -F.logsigmoid(signs * similarity / self.temperature)
-
-        # Compare each pair once; exclude comparisons with itself.
-        pairs = torch.triu(torch.ones_like(same_family), diagonal=1)
-        if not pairs.any():
-            return embeddings.sum() * 0
-
-        return loss[pairs].mean()
-
-
 class SupervisedContrastiveLoss(nn.Module):
-    # we learn with this
     def __init__(self, temperature=0.1):
         super().__init__()
         self.temperature = temperature
@@ -457,14 +439,16 @@ class SupervisedContrastiveLoss(nn.Module):
         return -(self.temperature / self.base_temperature) * mean_positive_log_prob[valid].mean()
 
 
-def train(model, train_loader, val_loader, criterion, device, gallery_loader, epochs=50, eval_every=1, lr=1e-4, writer=None, save_model=False, model_path="graph_embed.pth", constant_lr=False):
+def train(model, criterion, device,
+          train_loader, val_loader, gallery_loader,
+          epochs=50, eval_every=1, lr=1e-4, constant_lr=True, writer=None, save_model=False, model_path="graph_embed.pth"):
     # Hyperparameters
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr) # Investigate AdamW, weight decay and so
-    # Patience ony cares about evaluations, so be careful with eval_every
+
     scheduler = None
     if not constant_lr:
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=5, min_lr=1e-6) # (patience) * (eval_every) = real reduce_every
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=5*eval_every, min_lr=1e-6) # Patience ony cares about evaluations
     best_sensitivity = None
     val_names = {graph.name for graph in val_loader.dataset}
     global_step = 0
@@ -537,6 +521,7 @@ def train(model, train_loader, val_loader, criterion, device, gallery_loader, ep
                     torch.save(model.state_dict(), model_path)
                     print(f"New best model saved in {model_path} (Validation sensitivity {sensitivity:.4f})")
 
+
 def evaluate_loss(model, loader, criterion, device):
     model.eval()
     embeddings, families = [], []
@@ -550,27 +535,45 @@ def evaluate_loss(model, loader, criterion, device):
 
 def main():
     start = time.time()
+
+    # Prepare run hyperparameters
+    # Data handling
     parser = argparse.ArgumentParser(description="Train CV or SSE graphs from ALEPH annotations")
     parser.add_argument("--annotations", type=Path, required=True, help="Annotation folder containing family/SID.ent.pkl")
-    parser.add_argument("--dataset", choices=("scope95_full", "scope95_small", "scope95_toy"), default="scope95_small",
-                        help="SID selections in the datasets folder beside this script")
+    parser.add_argument("--dataset", choices=("scope95_full", "scope95_small", "scope95_toy"), default="scope95_small")
+    parser.add_argument("--output", type=Path, default=Path("training_output"))
+    # Graph selection
     parser.add_argument("--representation", choices=("cv", "sse"), default="cv")
-    parser.add_argument("--n-features", type=int, default=2)
+    parser.add_argument("--n-features", type=int, default=4)
+    # Model type and size
     parser.add_argument("--model", choices=("aleph", "dicey"), default="aleph")
     parser.add_argument("--operator", choices=("gatv2", "gine", "pna"), default="gine")
-    parser.add_argument("--hidden-dim", type=int, default=128)
+    parser.add_argument("--heads-dim", type=int, default=64)
     parser.add_argument("--num-layers", type=int, default=3)
+    parser.add_argument("--hidden-dim", type=int, default=128)
+    parser.add_argument("--embedding-dim", type=int, default=128)
+    parser.add_argument("--dropout", type=float, default=0.0)
+    # Training hyperparameters
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--constant-lr", action="store_true", help="Keep the learning rate fixed instead of reducing it on validation loss")
     parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--eval-every", type=int, default=1)
     parser.add_argument("--scale", action=argparse.BooleanOptionalAction, default=True) # --scale and --no-scale
+    parser.add_argument("--augmentation", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--families-to-compare", type=int, default=5)
+    parser.add_argument("--domains-per-family", type=int, default=6)
+    parser.add_argument("--loss-temperature", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=17)
-    parser.add_argument("--output", type=Path, default=Path("training_output"))
+
     args = parser.parse_args()
+
+    # Configure seed and parallelization
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.set_num_threads(1)
+
+    # Load directories
     project_dir = Path(__file__).resolve().parent
     split_dir = project_dir / "datasets" / args.dataset
     if args.output.resolve() in (project_dir, split_dir, args.annotations.resolve()):
@@ -578,53 +581,69 @@ def main():
     split_names = ("train_sid", "val_unseen_sid", "test_unseen_sid")
     print(f"Dataset: {args.dataset}; selections: {split_dir}", flush=True)
     args.output.mkdir(parents=True, exist_ok=True)
+
+    # Load train, validation and test data
     datasets = {}
     for name in split_names:
-        dataset = GraphDataset(args.annotations, split_dir / f"{name}.txt", representation=args.representation, n_features=args.n_features)
+        dataset = GraphDataset(args.annotations, split_dir / f"{name}.txt",
+                               representation=args.representation, n_features=args.n_features, augmentation=args.augmentation)
         datasets[name] = dataset
         if not len(dataset):
             raise ValueError(f"No usable graphs in {name}")
 
+    # Scale data, if selected
     if args.scale:
         statistics = fit_feature_scaling(datasets['train_sid'].data)
         torch.save(statistics, args.output / "feature_scaling.pt")
         for dataset in datasets.values():
             dataset.data = [scale_graph(graph, statistics) for graph in dataset.data]
 
-    train_loader = DataLoader(datasets["train_sid"], batch_sampler=FamilyBatchSampler(datasets["train_sid"]))
+    # Create dataloaders
+    train_loader = DataLoader(datasets["train_sid"], batch_sampler=FamilyBatchSampler(datasets["train_sid"],
+                                                                                      num_per_family=args.domains_per_family,
+                                                                                      other_families=args.families_to_compare))
     val_loader = DataLoader(datasets["val_unseen_sid"], batch_size=64, shuffle=False)
     test_loader = DataLoader(datasets["test_unseen_sid"], batch_size=64, shuffle=False)
     gallery = [graph for dataset in datasets.values() for graph in dataset]
     gallery_loader = DataLoader(gallery, batch_size=32, shuffle=False)
+
+    # Load model
     deg = None
     if args.operator == "pna":
         # Count each training graph once, without family oversampling.
         deg = PNAConv.get_degree_histogram(DataLoader(datasets["train_sid"], batch_size=64))
         torch.save(deg, args.output / "pna_degree_histogram.pt")
     if args.model == "dicey":
-        model = DiceyAlephModel(node_dim=datasets["train_sid"][0].x.shape[1],
-                       edge_dim=datasets["train_sid"][0].edge_attr.shape[1], hidden_dim=args.hidden_dim, embedding_dim=128, num_layers=args.num_layers, dropout=0.0, operator=args.operator, deg=deg)
+        model = DiceyAlephModel(node_dim=datasets["train_sid"][0].x.shape[1], edge_dim=datasets["train_sid"][0].edge_attr.shape[1],
+                                heads_dim=args.heads_dim, hidden_dim=args.hidden_dim, embedding_dim=args.embedding_dim, num_layers=args.num_layers,
+                                dropout=args.dropout, operator=args.operator, deg=deg)
     else:
-        model = AlephModel(node_dim=datasets["train_sid"][0].x.shape[1],
-                       edge_dim=datasets["train_sid"][0].edge_attr.shape[1], hidden_dim=args.hidden_dim, embedding_dim=128, num_layers=args.num_layers, dropout=0.0, operator=args.operator, deg=deg)
-    model_params = sum(p.numel() for p in model.parameters() if p.requires_grad) # traineable params only
-    criterion = SupervisedContrastiveLoss(temperature=0.1)
+        model = AlephModel(node_dim=datasets["train_sid"][0].x.shape[1], edge_dim=datasets["train_sid"][0].edge_attr.shape[1],
+                           heads_dim=args.heads_dim, hidden_dim=args.hidden_dim, embedding_dim=args.embedding_dim, num_layers=args.num_layers,
+                           dropout=args.dropout, operator=args.operator, deg=deg)
+    model_params = sum(p.numel() for p in model.parameters() if p.requires_grad) # trainable params only
+
+    print(f"Everything ready to train in {time.time() - start:.2f} seconds")
+
+    # Training configuration
+    criterion = SupervisedContrastiveLoss(temperature=args.loss_temperature)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model_path = args.output / "graph_embed.pth"
     log_directory = args.output / "tensorboard"
-    print(f"Everything ready to train in {time.time() - start:.2f} seconds")
     print(f"TensorBoard logs: {log_directory.resolve()}")
     with SummaryWriter(log_dir=str(log_directory)) as writer:
-        configuration = {**vars(args), "device": str(device),
-                         "split_graph_counts": {name: len(dataset) for name, dataset in datasets.items()}}
+        configuration = {**vars(args), "device": str(device), "split_graph_counts": {name: len(dataset) for name, dataset in datasets.items()}}
         writer.add_text("Run/config", json.dumps(configuration, indent=2, default=str), 0)
-        train(model, train_loader, val_loader, criterion, device, gallery_loader, epochs=args.epochs,
-              eval_every=1, lr=args.lr, writer=writer, save_model=True, model_path=model_path,
-              constant_lr=args.constant_lr)
+        # Train model
+        train(model, criterion, device,
+              train_loader, val_loader, gallery_loader,
+              epochs=args.epochs, eval_every=args.eval_every, lr=args.lr, constant_lr=args.constant_lr, writer=writer, save_model=True, model_path=model_path)
+        # Test model
         model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
         test_loss = evaluate_loss(model, test_loader, criterion, device)
         writer.add_scalar("Test Loss/best_validation_checkpoint", test_loss, args.epochs)
         embeddings, rows = embed_graphs(model, gallery_loader, device)
+        # Log results
         results = {"args": vars(args),
                    "model_parameters": model_params,
            **{name: {"family_sensitivity": family_sensitivity(embeddings, rows, {graph.name for graph in datasets[name]})}
@@ -633,7 +652,7 @@ def main():
         writer.add_scalar("Test/family_sensitivity", results["test_unseen_sid"]["family_sensitivity"], args.epochs)
         (args.output / "test_loss.txt").write_text(f"{test_loss}\n")
         print(f"Test loss for the best validation checkpoint: {test_loss:.4f}")
-# make augmentation optional
+
 
 if __name__ == "__main__":
     main()
