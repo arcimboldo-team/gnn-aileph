@@ -1,4 +1,5 @@
 import time
+script_start_time = time.time()
 import random
 import argparse
 import json
@@ -8,6 +9,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import sys
 from aleph_classes_graph import AlephPDB
+from copy import deepcopy
 
 import torch
 import torch.nn as nn
@@ -233,7 +235,7 @@ class FamilyBatchSampler(Sampler):
 
                 if len(indices) < self.num_per_family:
                     extra = random.choices(indices, k=self.num_per_family - len(indices))
-                    sampled = [(i, False) for i in range(len(indices))] + [(i, True) for i in extra]                    
+                    sampled = [(i, False) for i in indices] + [(i, True) for i in extra]
                 else:                    
                     sampled = [(i, False) for i in random.sample(indices, self.num_per_family)]
 
@@ -304,7 +306,7 @@ class AlephModel(nn.Module):
         )
         self.input_projection = nn.Linear(node_dim, hidden_dim)
 
-    def forward(self, x, edge_index=None, edge_attr=None, batch=None):
+    def forward(self, x, edge_index=None, edge_attr=None, batch=None, return_nodes=False):
         if isinstance(x, Data):
             data = x
             x, edge_index, edge_attr, batch = data.x, data.edge_index, data.edge_attr, data.batch
@@ -316,6 +318,8 @@ class AlephModel(nn.Module):
             x = F.dropout(h, p=self.dropout, training=self.training)
         if batch is None:
             batch = x.new_zeros(len(x), dtype=torch.long)
+        if return_nodes:
+            return x, batch
         g = torch.cat([global_mean_pool(x, batch), global_max_pool(x, batch)], dim=-1)
         return F.normalize(self.readout(g), dim=-1)
 
@@ -381,7 +385,7 @@ class DiceyAlephModel(nn.Module):
         )
         self.input_projection = nn.Linear(node_dim, hidden_dim)
 
-    def forward(self, x, edge_index=None, edge_attr=None, batch=None):
+    def forward(self, x, edge_index=None, edge_attr=None, batch=None, return_nodes=False):
         if isinstance(x, Data):
             x, edge_index, edge_attr, batch = x.x, x.edge_index, x.edge_attr, x.batch
         if batch is None:
@@ -393,6 +397,8 @@ class DiceyAlephModel(nn.Module):
             h = conv(F.elu(norm(x)), edge_index, edge_attr=edge_attr)  # pre-norm
             x = res(x) + F.dropout(h, p=self.dropout, training=self.training)
             pooled.append(torch.cat([global_mean_pool(x, batch), global_max_pool(x, batch)], -1))
+        if return_nodes:
+            return x, batch
         return F.normalize(self.readout(torch.cat(pooled, -1)), dim=-1)
 
 
@@ -439,26 +445,43 @@ class SupervisedContrastiveLoss(nn.Module):
         return -(self.temperature / self.base_temperature) * mean_positive_log_prob[valid].mean()
 
 
+@torch.no_grad()
+def update_ema(ema, model, decay):
+    for averaged, current in zip(ema.parameters(), model.parameters()):
+        averaged.mul_(decay).add_(current, alpha=1 - decay)
+    for averaged, current in zip(ema.buffers(), model.buffers()):
+        averaged.copy_(current)
+
+
 def train(model, criterion, device,
-          train_loader, val_loader, gallery_loader,
-          epochs=50, eval_every=1, lr=1e-4, constant_lr=True, writer=None, save_model=False, model_path="graph_embed.pth"):
+          train_loader, val_loader, gallery_loader, timing,
+          epochs=50, eval_every=1, lr=1e-4, constant_lr=True, use_ema=False, writer=None, save_model=False, model_path="graph_embed.pth"):
     # Hyperparameters
     model = model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr) # Investigate AdamW, weight decay and so
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
     scheduler = None
     if not constant_lr:
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=5*eval_every, min_lr=1e-6) # Patience ony cares about evaluations
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='max', factor=0.5, patience=5*eval_every, min_lr=1e-6) # Patience only cares about evaluations
+
+    ema_decay = 0.9999
+    ema_start_epoch = 0
+    ema = None
     best_sensitivity = None
     val_names = {graph.name for graph in val_loader.dataset}
     global_step = 0
 
     # Begin training
+    epoch_times = []
     for epoch in range(0, epochs):
+        if use_ema and epoch == ema_start_epoch:
+            ema = deepcopy(model).eval().requires_grad_(False)
+
         # Initialize variables
         start = time.time()
         model.train()
-        epoch_loss = 0
+        epoch_loss = 0.0
 
         for data in train_loader:
             data = data.to(device)
@@ -471,6 +494,10 @@ def train(model, criterion, device,
             train_loss = criterion(z, data.family)
             train_loss.backward()
             optimizer.step()
+
+            if ema is not None:
+                update_ema(ema, model, ema_decay)
+
             epoch_loss += train_loss.item()
 
             # Step-level logging
@@ -491,36 +518,37 @@ def train(model, criterion, device,
                 for name, param in model.named_parameters():
                     if param.numel():
                         writer.add_histogram(name, param, epoch+1)
+        epoch_times.append(elapsed)
         print(f"Epoch {epoch + 1}/{epochs}, Train Loss: {avg_train_loss:.4f}, Elapsed Time: {elapsed:.2f} seconds")
 
         # Evaluate every eval_every epochs
         if (epoch + 1) % eval_every == 0 or (epoch + 1) == epochs:
             start = time.time()
-            model.eval()
+            eval_model = ema if ema is not None else model
+            eval_model.eval()
             with torch.no_grad():
-                embeddings, rows = embed_graphs(model, gallery_loader, device)
+                embeddings, rows = embed_graphs(eval_model, gallery_loader, device)
                 indices = [i for i, (name, _) in enumerate(rows) if name in val_names]
                 avg_val_loss = criterion(embeddings[indices].to(device), [rows[i][1] for i in indices]).item()
                 sensitivity = family_sensitivity(embeddings, rows, val_names)
-                if writer is not None:
-                    writer.add_scalar("Validation/family_sensitivity", sensitivity, epoch+1)
-                print(f"Validation family sensitivity: {sensitivity:.4f}")
                 if scheduler is not None:
                     scheduler.step(sensitivity)
 
                 # Logging
                 elapsed = time.time() - start
                 if writer is not None:
+                    writer.add_scalar("Validation/family_sensitivity", sensitivity, epoch + 1)
                     writer.add_scalar("Validation Loss/validation_epoch", avg_val_loss, epoch+1)
-                    writer.add_scalar("Time/validation_seconds", elapsed, epoch+1)
+                print(f"Validation family sensitivity: {sensitivity:.4f}")
                 print(f"Validation Loss: {avg_val_loss:.4f}, Elapsed Time: {elapsed:.2f} seconds")
 
                 # Select by mean validation family sensitivity, as in Progres.
                 if save_model and (best_sensitivity is None or sensitivity > best_sensitivity):
                     best_sensitivity = sensitivity
-                    torch.save(model.state_dict(), model_path)
+                    torch.save(eval_model.state_dict(), model_path)
                     print(f"New best model saved in {model_path} (Validation sensitivity {sensitivity:.4f})")
 
+    timing["mean_epoch_seconds"] = sum(epoch_times) / len(epoch_times)
 
 def evaluate_loss(model, loader, criterion, device):
     model.eval()
@@ -559,7 +587,8 @@ def main():
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--eval-every", type=int, default=1)
     parser.add_argument("--scale", action=argparse.BooleanOptionalAction, default=True) # --scale and --no-scale
-    parser.add_argument("--augmentation", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--augmentation", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--ema", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--families-to-compare", type=int, default=5)
     parser.add_argument("--domains-per-family", type=int, default=6)
     parser.add_argument("--loss-temperature", type=float, default=0.1)
@@ -584,9 +613,10 @@ def main():
 
     # Load train, validation and test data
     datasets = {}
-    for name in split_names:
+    for i, name in enumerate(split_names):
+        augmentation = args.augmentation if i == 0 else False # Apply augmentation only on training data
         dataset = GraphDataset(args.annotations, split_dir / f"{name}.txt",
-                               representation=args.representation, n_features=args.n_features, augmentation=args.augmentation)
+                               representation=args.representation, n_features=args.n_features, augmentation=augmentation)
         datasets[name] = dataset
         if not len(dataset):
             raise ValueError(f"No usable graphs in {name}")
@@ -623,7 +653,7 @@ def main():
                            dropout=args.dropout, operator=args.operator, deg=deg)
     model_params = sum(p.numel() for p in model.parameters() if p.requires_grad) # trainable params only
 
-    print(f"Everything ready to train in {time.time() - start:.2f} seconds")
+    timing = {"setup_seconds": time.time() - start}
 
     # Training configuration
     criterion = SupervisedContrastiveLoss(temperature=args.loss_temperature)
@@ -635,23 +665,29 @@ def main():
         configuration = {**vars(args), "device": str(device), "split_graph_counts": {name: len(dataset) for name, dataset in datasets.items()}}
         writer.add_text("Run/config", json.dumps(configuration, indent=2, default=str), 0)
         # Train model
+        start = time.time()
         train(model, criterion, device,
-              train_loader, val_loader, gallery_loader,
-              epochs=args.epochs, eval_every=args.eval_every, lr=args.lr, constant_lr=args.constant_lr, writer=writer, save_model=True, model_path=model_path)
-        # Test model
+              train_loader, val_loader, gallery_loader, timing,
+              epochs=args.epochs, eval_every=args.eval_every, lr=args.lr, constant_lr=args.constant_lr,
+              use_ema=args.ema, writer=writer, save_model=True, model_path=model_path)
+        timing["train_seconds"] = time.time() - start
+        # Test model and log results
+        start = time.time()
         model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
         test_loss = evaluate_loss(model, test_loader, criterion, device)
         writer.add_scalar("Test Loss/best_validation_checkpoint", test_loss, args.epochs)
         embeddings, rows = embed_graphs(model, gallery_loader, device)
-        # Log results
-        results = {"args": vars(args),
-                   "model_parameters": model_params,
-           **{name: {"family_sensitivity": family_sensitivity(embeddings, rows, {graph.name for graph in datasets[name]})}
-              for name in ("val_unseen_sid", "test_unseen_sid")}}
-        (args.output / "results.json").write_text(json.dumps(results, indent=2, default=str) + "\n")
+        results = {"args": vars(args), "model_parameters": model_params,
+                    **{name: {"family_sensitivity": family_sensitivity(embeddings, rows, {graph.name for graph in datasets[name]})}
+                    for name in ("val_unseen_sid", "test_unseen_sid")}}
+        timing["test_seconds"] = time.time() - start
         writer.add_scalar("Test/family_sensitivity", results["test_unseen_sid"]["family_sensitivity"], args.epochs)
         (args.output / "test_loss.txt").write_text(f"{test_loss}\n")
         print(f"Test loss for the best validation checkpoint: {test_loss:.4f}")
+        timing["total_seconds"] = time.time() - script_start_time
+        results["timing"] = timing
+        (args.output / "results.json").write_text(json.dumps(results, indent=2, default=str) + "\n")
+
 
 
 if __name__ == "__main__":
