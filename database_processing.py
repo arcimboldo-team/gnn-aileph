@@ -87,15 +87,7 @@ class DataSelection:
                        blacklist: list | None = None,
                        force_family: bool = False,
                        seed: int = 42):
-        """
-        Select a portion of the found PDBs and store them in a list. Keep their families in a second list as labels.
-        It can be used as a standalone function, but it is usually used to create multiple sets through 'create_sets'.
-        'out_path' saves the selection on a given path. Only needed for standalone use.
-        'force_family' when True ensures the PDBs are clustered by family and, if multiple sets are being created,
-        that families are not on more than one of them.
-        'not_alone_data' allows the function to receive a dictionary with the same structure as the one it returns.
-        It can be used to skip parts of data already sampled in previous selections.
-        """
+
         random.seed(seed)
         possible_pdbs = []
 
@@ -151,10 +143,6 @@ class DataSelection:
                     force_family: bool = True): # about families and size
         """
         Create len(proportion) sets using 'make_selection'. Similar to a 'train_test_split' function.
-        'proportion' defines the proportion of data each set should contain. An 80-20 split should be [0.8, 0.2].
-        'size' defines the number of elements the dataset will have. If zero or negative, all possible PDBs are used.
-        'out_path' saves the sets on a given path. The JSON can later be used to compute the similarity between pairs
-        of PDBs and to create their respective graphs.
         'force_family' when True ensures the PDBs are clustered by family and, if multiple sets are being created,
         that families are not on more than one of them.
         """
@@ -187,6 +175,5 @@ class DataSelection:
 MAIN
 '''
 if __name__ == "__main__":
-    selection = DataSelection("/localdata1/arnau/scope/scope95_fam_circular_permutation/scope95_fam_cp")
-    selection.locate_pdbs()
-    sets = selection.create_sets(proportion=[0.8, 0.2], force_family=False)
+    selection = DataSelection("/localdata-ssd/arnau/scope/scope95_fam_circular_permutation/scope95_fam_cp")
+    selection.locate_pdbs(force=True)
