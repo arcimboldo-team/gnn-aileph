@@ -123,17 +123,16 @@ def build_graph_sse(annotation, dist_threshold=10.0, n_features=4):
                 edge_attr=torch.tensor(edge_attr, dtype=torch.float32).reshape(-1, 6))
 
 
-def augment(data, edge_drop_p=0.05, feat_mask_p=0.2):
+def augment(data, sigma=0.05):
     data_aug = data.clone()
-    data_aug.edge_index, edge_mask = dropout_edge(data.edge_index, p=edge_drop_p)
-    data_aug.edge_attr = data.edge_attr[edge_mask]
-    data_aug.x, _ = mask_feature(data.x, p=feat_mask_p, mode='all')
+    data_aug.x = data.x * (1 + sigma * torch.randn_like(data.x))
+    data_aug.edge_attr = data.edge_attr * (1 + sigma * torch.randn_like(data.edge_attr))
     return data_aug
 
 
 class GraphDataset(Dataset):
     """Build the selected graphs once from complete AlephPDB annotation pickles."""
-    def __init__(self, data_path, selection_path, representation, n_features, augmentation, dist_threshold=10.0):
+    def __init__(self, data_path, selection_path, representation, n_features, augmentation, aug_mode="all", inference=False, dist_threshold=10.0):
         super().__init__()
         self.data_path = Path(data_path)
         if not self.data_path.is_dir():
@@ -143,6 +142,9 @@ class GraphDataset(Dataset):
                         if not (self.data_path / family / f"{sid}.ent.pkl").is_file()]
         missing = set(self.missing)
         self.augmentation = augmentation
+        self.aug_mode = aug_mode
+        self.inference = inference
+
         self.graphs = []
         self.data = []
         self.graph_by_fam = {}
@@ -152,6 +154,8 @@ class GraphDataset(Dataset):
             if (name, fam) in missing:
                 continue
             path = self.data_path / fam / f"{name}.ent.pkl"
+            if self.inference:
+                name = f"{name}_inference"
             graph = build_graph(path, name, fam, dist_threshold, representation=representation, n_features=n_features)
             graph.validate(raise_on_error=True)
             if graph.num_nodes == 0:
@@ -171,7 +175,13 @@ class GraphDataset(Dataset):
         if isinstance(idx, tuple):
             i, aug = idx
             if self.augmentation:
-                return augment(self.data[i]) if aug else self.data[i]
+                if self.aug_mode=="repeated":
+                    return augment(self.data[i]) if aug else self.data[i]
+                elif self.aug_mode=="all":
+                    return augment(self.data[i])
+                else:
+                    raise ValueError("Augmentation mode must be 'repeated' or 'all'")
+
             else:
                 return self.data[i]
         return super().__getitem__(idx)
@@ -191,22 +201,28 @@ def fit_feature_scaling(training_graphs):
             [graph[field] for graph in training_graphs], dim=0
         ).double()
         mean = values.mean(dim=0)
+        median = values.median(dim=0).values
         std = values.std(dim=0, unbiased=False)
+        q75, q25 = torch.quantile(values, torch.tensor([0.75, 0.25], dtype=values.dtype), dim=0)
+        iqr_range = q75 - q25
         std[std < 1e-8] = 1.0
-        statistics[field] = {"mean": mean, "std": std}
+        iqr_range[iqr_range < 1e-8] = 1.0
+        statistics[field] = {"mean": mean, "median": median, "std": std, "iqr_range": iqr_range}
 
     return statistics
 
 
-def scale_graph(graph, statistics):
+def scale_graph(graph, statistics, outliers=False):
+    center_key, scale_key = ("median", "iqr_range") if outliers else ("mean", "std")
+
     graph = graph.clone()
 
     for field in ("x", "edge_attr"):
         values = graph[field]
-        mean = statistics[field]["mean"].to(values)
-        std = statistics[field]["std"].to(values)
+        center = statistics[field][center_key].to(values)
+        scale = statistics[field][scale_key].to(values)
 
-        graph[field] = (values - mean) / std
+        graph[field] = (values - center) / scale
 
     return graph
 
@@ -571,7 +587,7 @@ def main():
     parser.add_argument("--dataset", choices=("scope95_full", "scope95_small", "scope95_toy"), default="scope95_small")
     parser.add_argument("--output", type=Path, default=Path("training_output"))
     # Graph selection
-    parser.add_argument("--representation", choices=("cv", "sse"), default="cv")
+    parser.add_argument("--representation", choices=("cv", "sse"), default="sse")
     parser.add_argument("--n-features", type=int, default=4)
     # Model type and size
     parser.add_argument("--model", choices=("aleph", "dicey"), default="aleph")
@@ -583,16 +599,23 @@ def main():
     parser.add_argument("--dropout", type=float, default=0.0)
     # Training hyperparameters
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--constant-lr", action="store_true", help="Keep the learning rate fixed instead of reducing it on validation loss")
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--constant-lr", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--epochs", type=int, default=150)
     parser.add_argument("--eval-every", type=int, default=1)
     parser.add_argument("--scale", action=argparse.BooleanOptionalAction, default=True) # --scale and --no-scale
+    parser.add_argument("--outliers", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--augmentation", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--aug-mode", choices=("repeated", "all"), default="all")
     parser.add_argument("--ema", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--families-to-compare", type=int, default=5)
     parser.add_argument("--domains-per-family", type=int, default=6)
     parser.add_argument("--loss-temperature", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=17)
+
+    # Inference mode
+    parser.add_argument("--inference", type=Path, default=None)
+    parser.add_argument("--inference-dataset", choices="circular_permutations", default="circular_permutations")
+    parser.add_argument("--inference-model", type=Path, default=None)
 
     args = parser.parse_args()
 
@@ -610,23 +633,36 @@ def main():
     split_names = ("train_sid", "val_unseen_sid", "test_unseen_sid")
     print(f"Dataset: {args.dataset}; selections: {split_dir}", flush=True)
     args.output.mkdir(parents=True, exist_ok=True)
+    if args.inference:
+        project_dir = Path(__file__).resolve().parent
+        inference_dir = project_dir / "datasets" / args.inference_dataset
+        print(f"Dataset: {args.inference_dataset}; selections: {inference_dir}", flush=True)
 
-    # Load train, validation and test data
+    # Load data splits
     datasets = {}
     for i, name in enumerate(split_names):
         augmentation = args.augmentation if i == 0 else False # Apply augmentation only on training data
         dataset = GraphDataset(args.annotations, split_dir / f"{name}.txt",
-                               representation=args.representation, n_features=args.n_features, augmentation=augmentation)
+                               representation=args.representation, n_features=args.n_features,
+                               augmentation=augmentation, aug_mode=args.aug_mode)
         datasets[name] = dataset
         if not len(dataset):
             raise ValueError(f"No usable graphs in {name}")
+    if args.inference:
+        dataset = GraphDataset(args.annotations, inference_dir / "inference_sid.txt",
+                               representation=args.representation, n_features=args.n_features,
+                               augmentation=False, inference=True)
+        datasets["inference_sid"] = dataset
 
     # Scale data, if selected
     if args.scale:
-        statistics = fit_feature_scaling(datasets['train_sid'].data)
-        torch.save(statistics, args.output / "feature_scaling.pt")
+        if args.inference:
+            statistics = torch.load(args.inference_model / "feature_scaling.pt")
+        else:
+            statistics = fit_feature_scaling(datasets['train_sid'].data)
+            torch.save(statistics, args.output / "feature_scaling.pt")
         for dataset in datasets.values():
-            dataset.data = [scale_graph(graph, statistics) for graph in dataset.data]
+            dataset.data = [scale_graph(graph, statistics, outliers=args.outliers) for graph in dataset.data]
 
     # Create dataloaders
     train_loader = DataLoader(datasets["train_sid"], batch_sampler=FamilyBatchSampler(datasets["train_sid"],
@@ -640,9 +676,12 @@ def main():
     # Load model
     deg = None
     if args.operator == "pna":
-        # Count each training graph once, without family oversampling.
-        deg = PNAConv.get_degree_histogram(DataLoader(datasets["train_sid"], batch_size=64))
-        torch.save(deg, args.output / "pna_degree_histogram.pt")
+        if args.inference:
+            deg = torch.load(args.inference_model / "pna_degree_histogram.pt")
+        else:
+            # Count each training graph once, without family oversampling.
+            deg = PNAConv.get_degree_histogram(DataLoader(datasets["train_sid"], batch_size=64))
+            torch.save(deg, args.output / "pna_degree_histogram.pt")
     if args.model == "dicey":
         model = DiceyAlephModel(node_dim=datasets["train_sid"][0].x.shape[1], edge_dim=datasets["train_sid"][0].edge_attr.shape[1],
                                 heads_dim=args.heads_dim, hidden_dim=args.hidden_dim, embedding_dim=args.embedding_dim, num_layers=args.num_layers,
@@ -665,21 +704,27 @@ def main():
         configuration = {**vars(args), "device": str(device), "split_graph_counts": {name: len(dataset) for name, dataset in datasets.items()}}
         writer.add_text("Run/config", json.dumps(configuration, indent=2, default=str), 0)
         # Train model
-        start = time.time()
-        train(model, criterion, device,
-              train_loader, val_loader, gallery_loader, timing,
-              epochs=args.epochs, eval_every=args.eval_every, lr=args.lr, constant_lr=args.constant_lr,
-              use_ema=args.ema, writer=writer, save_model=True, model_path=model_path)
-        timing["train_seconds"] = time.time() - start
+        if not args.inference:
+            start = time.time()
+            train(model, criterion, device,
+                  train_loader, val_loader, gallery_loader, timing,
+                  epochs=args.epochs, eval_every=args.eval_every, lr=args.lr, constant_lr=args.constant_lr,
+                  use_ema=args.ema, writer=writer, save_model=True, model_path=model_path)
+            timing["train_seconds"] = time.time() - start
+        else:
+            model_path = args.inference_model / "graph_embed.pth"
         # Test model and log results
         start = time.time()
         model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+        model.to(device)
         test_loss = evaluate_loss(model, test_loader, criterion, device)
         writer.add_scalar("Test Loss/best_validation_checkpoint", test_loss, args.epochs)
         embeddings, rows = embed_graphs(model, gallery_loader, device)
+        if args.inference: # still not done the metric
+            eval_results = family_sensitivity(embeddings, rows, {graph.name for graph in datasets["inference_sid"]}, inference=True)
         results = {"args": vars(args), "model_parameters": model_params,
                     **{name: {"family_sensitivity": family_sensitivity(embeddings, rows, {graph.name for graph in datasets[name]})}
-                    for name in ("val_unseen_sid", "test_unseen_sid")}}
+                                                                                        for name in ("val_unseen_sid", "test_unseen_sid")}}
         timing["test_seconds"] = time.time() - start
         writer.add_scalar("Test/family_sensitivity", results["test_unseen_sid"]["family_sensitivity"], args.epochs)
         (args.output / "test_loss.txt").write_text(f"{test_loss}\n")

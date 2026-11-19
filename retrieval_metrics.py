@@ -14,7 +14,7 @@ def embed_graphs(model, loader, device):
 
 
 @torch.no_grad()
-def family_sensitivity(embeddings, rows, query_names):
+def family_sensitivity(embeddings, rows, query_names, inference=False):
     """Same-family hits before the first different-fold hit, including self."""
     z = embeddings.detach().cpu()
     families = [family for _, family in rows]
