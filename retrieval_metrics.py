@@ -14,7 +14,7 @@ def embed_graphs(model, loader, device):
 
 
 @torch.no_grad()
-def family_sensitivity(embeddings, rows, query_names, inference=False):
+def family_sensitivity(embeddings, rows, query_names):
     """Same-family hits before the first different-fold hit, including self."""
     z = embeddings.detach().cpu()
     families = [family for _, family in rows]
@@ -34,3 +34,25 @@ def family_sensitivity(embeddings, rows, query_names, inference=False):
                 break
         sensitivities.append(count_tp / total_pos)
     return float(np.mean(sensitivities))
+
+
+@torch.no_grad()
+def cp_metric(embeddings, rows, top_n=None):
+    """Recall@k of the original for each _inference query (self excluded), for k = 1, 5, 10 and top_n."""
+    z = embeddings.detach().cpu()
+    names = [name for name, _ in rows]
+    index = {name: i for i, name in enumerate(names)}
+    ranks = []
+    for i, name in enumerate(names):
+        if not name.endswith("_inference"):
+            continue
+        original = name.removesuffix("_inference")
+        if original not in index:
+            continue
+        j = index[original]
+        similarities = z[i] @ z.T
+        similarities[i] = -float("inf")  # exclude self
+        ranks.append((similarities > similarities[j]).sum().item())  # 0 = most similar
+    ranks = np.array(ranks)
+    ks = sorted({1, 5, 10} | ({top_n} if top_n else set()))
+    return {f"recall@{k}": float(np.mean(ranks < k)) for k in ks}

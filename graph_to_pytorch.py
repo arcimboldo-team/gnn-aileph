@@ -15,12 +15,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.data import Data, Dataset
-from torch_geometric.utils import dropout_edge, mask_feature
 from torch.utils.data import Sampler
 from torch_geometric.loader import DataLoader
 from torch_geometric.nn import GATv2Conv, GINEConv, PNAConv, global_max_pool, global_mean_pool
 from torch.utils.tensorboard import SummaryWriter
-from retrieval_metrics import embed_graphs, family_sensitivity
+from retrieval_metrics import embed_graphs, family_sensitivity, cp_metric
 
 
 
@@ -619,6 +618,13 @@ def main():
 
     args = parser.parse_args()
 
+    if args.inference:
+        saved = json.loads((args.inference_model / "results.json").read_text())["args"]
+        for key in ("representation", "n_features", "model", "operator", "heads_dim",
+                    "num_layers", "hidden_dim", "embedding_dim", "dropout"):
+            setattr(args, key, saved[key])
+
+
     # Configure seed and parallelization
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -640,19 +646,27 @@ def main():
 
     # Load data splits
     datasets = {}
-    for i, name in enumerate(split_names):
-        augmentation = args.augmentation if i == 0 else False # Apply augmentation only on training data
-        dataset = GraphDataset(args.annotations, split_dir / f"{name}.txt",
-                               representation=args.representation, n_features=args.n_features,
-                               augmentation=augmentation, aug_mode=args.aug_mode)
-        datasets[name] = dataset
-        if not len(dataset):
-            raise ValueError(f"No usable graphs in {name}")
     if args.inference:
         dataset = GraphDataset(args.annotations, inference_dir / "inference_sid.txt",
                                representation=args.representation, n_features=args.n_features,
                                augmentation=False, inference=True)
         datasets["inference_sid"] = dataset
+        for i, name in enumerate(split_names):
+            dataset = GraphDataset(args.annotations, split_dir / f"{name}.txt",
+                                   representation=args.representation, n_features=args.n_features,
+                                   augmentation=False)
+            datasets[name] = dataset
+            if not len(dataset):
+                raise ValueError(f"No usable graphs in {name}")
+    else:
+        for i, name in enumerate(split_names):
+            augmentation = args.augmentation if i == 0 else False # Apply augmentation only on training data
+            dataset = GraphDataset(args.annotations, split_dir / f"{name}.txt",
+                                   representation=args.representation, n_features=args.n_features,
+                                   augmentation=augmentation, aug_mode=args.aug_mode)
+            datasets[name] = dataset
+            if not len(dataset):
+                raise ValueError(f"No usable graphs in {name}")
 
     # Scale data, if selected
     if args.scale:
@@ -720,8 +734,6 @@ def main():
         test_loss = evaluate_loss(model, test_loader, criterion, device)
         writer.add_scalar("Test Loss/best_validation_checkpoint", test_loss, args.epochs)
         embeddings, rows = embed_graphs(model, gallery_loader, device)
-        if args.inference: # still not done the metric
-            eval_results = family_sensitivity(embeddings, rows, {graph.name for graph in datasets["inference_sid"]}, inference=True)
         results = {"args": vars(args), "model_parameters": model_params,
                     **{name: {"family_sensitivity": family_sensitivity(embeddings, rows, {graph.name for graph in datasets[name]})}
                                                                                         for name in ("val_unseen_sid", "test_unseen_sid")}}
@@ -729,6 +741,8 @@ def main():
         writer.add_scalar("Test/family_sensitivity", results["test_unseen_sid"]["family_sensitivity"], args.epochs)
         (args.output / "test_loss.txt").write_text(f"{test_loss}\n")
         print(f"Test loss for the best validation checkpoint: {test_loss:.4f}")
+        if args.inference:
+            results["inference_results"] = cp_metric(embeddings, rows)
         timing["total_seconds"] = time.time() - script_start_time
         results["timing"] = timing
         (args.output / "results.json").write_text(json.dumps(results, indent=2, default=str) + "\n")
